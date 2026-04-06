@@ -16,7 +16,7 @@ PIXEL_SCALE = 0.2
 STAMP_SIZE = 51
 FWHM = 0.7
 # NOISE = 1.0
-NOISE = 0.00001
+# NOISE = 0.00001
 # NOISE = 0.01
 
 
@@ -32,6 +32,339 @@ def measure_edge_bg(image, width):
                     bsum += image[row, col]
 
     return bsum / image.size
+
+
+class PriorCoellipWithSky(ngmix.joint_prior.PriorSimpleSep):
+    def __init__(
+        self, ngauss, cen_prior, g_prior, T_prior, F_prior, sky_prior
+    ):
+        self.ngauss = ngauss
+        self.npars = ngmix.gmix.get_coellip_npars(ngauss) + 1
+
+        super().__init__(
+            cen_prior, g_prior, T_prior, F_prior
+        )
+        self.sky_prior = sky_prior
+
+        if self.nband != 1:
+            raise ValueError("coellip only supports one band")
+
+        self.bounds = None
+
+    def set_bounds(self):
+        """
+        set possibe bounds
+        """
+        self.bounds = None
+
+    def fill_fdiff(self, pars, fdiff):
+        """
+        set sqrt(-2ln(p)) ~ (model-data)/err
+
+        Parameters
+        ----------
+        pars: array
+            Array of parameters values
+        fdiff: array
+            the fdiff array to fill
+        """
+
+        if len(pars) != self.npars:
+            raise ValueError(
+                'pars size %d expected %d' % (len(pars), self.npars)
+            )
+
+        ngauss = self.ngauss
+
+        index = 0
+
+        lnp1, lnp2 = self.cen_prior.get_lnprob_scalar_sep(pars[0], pars[1])
+
+        fdiff[index] = lnp1
+        index += 1
+        fdiff[index] = lnp2
+        index += 1
+
+        fdiff[index] = self.g_prior.get_lnprob_scalar2d(pars[2], pars[3])
+        index += 1
+
+        for i in range(ngauss):
+            fdiff[index] = self.T_prior.get_lnprob_scalar(pars[4 + i])
+            index += 1
+
+        F_prior = self.F_priors[0]
+        for i in range(ngauss):
+            fdiff[index] = F_prior.get_lnprob_scalar(pars[4 + ngauss + i])
+            index += 1
+
+        # sky
+        fdiff[index] = self.sky_prior.get_lnprob_scalar(
+            # ngauss for T and flux, plus one for sky
+            pars[4 + 2 * ngauss]
+        )
+        index += 1
+
+        chi2 = -2 * fdiff[0:index]
+        chi2.clip(min=0.0, max=None, out=chi2)
+        fdiff[0:index] = np.sqrt(chi2)
+
+        return index
+
+    def sample(self, nrand=None):
+        """
+        Get random samples
+
+        Parameters
+        ----------
+        nrand: int, optional
+            Number of samples, default to a single set with size [npars].  If n
+            is sent the result will have shape [n, npars]
+        """
+
+        if nrand is None:
+            is_scalar = True
+            nrand = 1
+        else:
+            is_scalar = False
+
+        ngauss = self.ngauss
+        samples = np.zeros((nrand, self.npars))
+
+        cen1, cen2 = self.cen_prior.sample(nrand)
+        g1, g2 = self.g_prior.sample2d(nrand)
+        T = self.T_prior.sample(nrand)
+
+        samples[:, 0] = cen1
+        samples[:, 1] = cen2
+        samples[:, 2] = g1
+        samples[:, 3] = g2
+        samples[:, 4] = T
+
+        for i in range(ngauss):
+            samples[:, 4 + i] += self.T_prior.sample(nrand)
+
+        F_prior = self.F_priors[0]
+        for i in range(ngauss):
+            samples[:, 4 + ngauss + i] = F_prior.sample(nrand)
+
+        if is_scalar:
+            samples = samples[0, :]
+        return samples
+
+
+@njit
+def fill_fdiff_with_sky(gmix, sky, pixels, fdiff, start):
+    """
+    fill fdiff array (model-data)/err
+
+    parameters
+    ----------
+    gmix: gaussian mixture
+        See gmix.py
+    pixels: array if pixel structs
+        u,v,val,ierr
+    fdiff: array
+        Array to fill, should be same length as pixels
+    """
+
+    if gmix["norm_set"][0] == 0:
+        gmix_set_norms(gmix)
+
+    n_pixels = pixels.shape[0]
+
+    for ipixel in range(n_pixels):
+        pixel = pixels[ipixel]
+
+        pixel_val = pixel['val']
+        model_val = gmix_eval_pixel_fast(gmix, pixel) + sky
+
+        fdiff[start + ipixel] = (model_val - pixel_val) * pixel["ierr"]
+
+
+class FitSkyCoellipFitter(ngmix.fitting.CoellipFitter):
+    def _make_fit_model(self, obs, guess):
+        return FitSkyCoellipFitModel(
+            obs=obs,
+            ngauss=self._ngauss,
+            guess=guess,
+            prior=self.prior,
+        )
+
+
+class FitSkyCoellipFitModel(ngmix.fitting.results.CoellipFitModel):
+    def calc_fdiff(self, pars):
+        """
+        vector with (model-data)/error.
+
+        The npars elements contain -ln(prior)
+        """
+
+        # we cannot keep sending existing array into leastsq, don't know why
+        fdiff = np.zeros(self.fdiff_size)
+
+        # c1, c2, g1, g2, T1, ..TN, F1...FN, sky
+        # sky = pars[4 + 2 * self._ngauss]
+        sky = pars[-1]
+
+        try:
+            # all norms are set after fill
+            self._fill_gmix_all(pars)
+
+            start = self._fill_priors(pars=pars, fdiff=fdiff)
+
+            for pixels, gm in zip(self._pixels_list, self._gmix_data_list):
+                fill_fdiff_with_sky(gm, sky, pixels, fdiff, start)
+
+                start += pixels.size
+
+        except GMixRangeError:
+            fdiff[:] = LOWVAL
+
+        return fdiff
+
+    def set_fit_result(self, result):
+        super().set_fit_result(result)
+        self['sky'] = result['pars'][-1]
+        self['sky_err'] = np.sqrt(result["pars_cov"][-1, -1])
+
+    def get_gmix(self, band=0):
+        """
+        Get a gaussian mixture at the fit parameter set, which
+        definition depends on the sub-class
+
+        Parameters
+        ----------
+        band: int, optional
+            Band index, default 0
+        """
+        pars = self.get_band_pars(pars=self["pars"][:-1], band=band)
+        return ngmix.gmix.make_gmix_model(pars, self.model)
+
+    def _init_gmix_all(self, pars):
+        super()._init_gmix_all(pars[:-1])
+
+    def _fill_gmix_all(self, pars):
+        super()._fill_gmix_all(pars[:-1])
+
+    def _set_npars(self):
+        """
+        single band, npars determined from ngauss
+        """
+        # add one for sky
+        self.npars = 4 + 2 * self._ngauss + 1
+
+    def _set_n_prior_pars(self):
+        # center1 + center2 + shape + T + fluxes
+        if self.prior is None:
+            self.n_prior_pars = 0
+        else:
+            # add one for sky
+            ngauss = self._ngauss
+            self.n_prior_pars = 1 + 1 + 1 + ngauss + ngauss + 1
+
+
+def get_coellip_with_sky_prior(rng, ngauss, scale, T_range=None, F_range=None):
+    """
+    get a prior for use with the maximum likelihood fitter
+
+    Parameters
+    ----------
+    rng: np.random.RandomState
+        The random number generator
+    scale: float
+        Pixel scale
+    T_range: (float, float), optional
+        The range for the prior on T
+    F_range: (float, float), optional
+        Fhe range for the prior on flux
+    """
+    if T_range is None:
+        T_range = [-1.0, 1.0e3]
+        # T_range = [0.05, 1.e3]
+    if F_range is None:
+        F_range = [-100.0, 1.0e9]
+        # F_range = [0.05, 1.e9]
+
+    g_prior = ngmix.priors.GPriorBA(sigma=0.5, rng=rng)
+    cen_prior = ngmix.priors.CenPrior(
+        cen1=0,
+        cen2=0,
+        sigma1=scale * 0.01,
+        sigma2=scale * 0.01,
+        rng=rng,
+    )
+    T_prior = ngmix.priors.FlatPrior(
+        minval=T_range[0],
+        maxval=T_range[1],
+        rng=rng,
+    )
+    F_prior = ngmix.priors.FlatPrior(
+        minval=F_range[0],
+        maxval=F_range[1],
+        rng=rng,
+    )
+
+    sky_prior = ngmix.priors.Normal(mean=0, sigma=0.1, rng=rng)
+
+    prior = PriorCoellipWithSky(
+        ngauss=ngauss,
+        cen_prior=cen_prior,
+        g_prior=g_prior,
+        T_prior=T_prior,
+        F_prior=F_prior,
+        sky_prior=sky_prior,
+    )
+
+    return prior
+
+
+class FitSkyCoellipPSFGuesser(ngmix.guessers.CoellipPSFGuesser):
+    def __call__(self, obs):
+        """
+        Get a guess for the EM algorithm
+
+        Parameters
+        ----------
+        obs: Observation
+            Starting flux and T for the overall mixture are derived from the
+            input observation.  How depends on the gauss_from_moms constructor
+            argument
+
+        Returns
+        -------
+        guess: array
+            The guess array, [cen1, cen2, g1, g2, T1, T2, ..., F1, F2, ...]
+        """
+        sky_guess = self.rng.normal(scale=0.01)
+
+        guess0 = super()._get_guess(obs=obs)
+
+        guess = np.zeros(guess0.size + 1)
+        guess[:guess0.size] = guess0
+
+        guess[-1] = sky_guess
+
+        return guess
+
+
+def get_coellip_runner_with_sky(rng, ngauss):
+    # prior = None
+    prior = get_coellip_with_sky_prior(
+        ngauss=ngauss, rng=rng, scale=PIXEL_SCALE,
+    )
+
+    fitter = FitSkyCoellipFitter(ngauss=ngauss, prior=prior)
+
+    # guesser = ngmix.guessers.SimplePSFGuesser(
+    #     rng=rng, guess_from_moms=True,
+    # )
+    guesser = FitSkyCoellipPSFGuesser(rng=rng, ngauss=ngauss)
+
+    return ngmix.runners.Runner(
+        fitter=fitter,
+        guesser=guesser,
+        ntry=2,
+    )
 
 
 @njit
@@ -77,7 +410,10 @@ def fill_fdiff_subtract_mean(gmix, pixels, fdiff, start):
 class SubMeanCoellipFitter(ngmix.fitting.CoellipFitter):
     def _make_fit_model(self, obs, guess):
         return SubMeanCoellipFitModel(
-            obs=obs, ngauss=self._ngauss, guess=guess, prior=self.prior,
+            obs=obs,
+            ngauss=self._ngauss,
+            guess=guess,
+            prior=self.prior,
         )
 
 
@@ -93,7 +429,6 @@ class SubMeanCoellipFitModel(ngmix.fitting.results.CoellipFitModel):
         fdiff = np.zeros(self.fdiff_size)
 
         try:
-
             # all norms are set after fill
             self._fill_gmix_all(pars)
 
@@ -113,7 +448,10 @@ class SubMeanCoellipFitModel(ngmix.fitting.results.CoellipFitModel):
 class SubMeanFitter(ngmix.fitting.Fitter):
     def _make_fit_model(self, obs, guess):
         return SubMeanFitModel(
-            obs=obs, model=self.model, guess=guess, prior=self.prior,
+            obs=obs,
+            model=self.model,
+            guess=guess,
+            prior=self.prior,
         )
 
 
@@ -129,7 +467,6 @@ class SubMeanFitModel(ngmix.fitting.results.FitModel):
         fdiff = np.zeros(self.fdiff_size)
 
         try:
-
             # all norms are set after fill
             self._fill_gmix_all(pars)
 
@@ -151,7 +488,7 @@ def make_obj(flux):
     # return galsim.Gaussian(fwhm=FWHM, flux=flux)
 
 
-def make_image(rng, flux):
+def make_image(rng, flux, noise):
     obj = make_obj(flux)
 
     offset = rng.uniform(low=-0.5, high=0.5, size=2)
@@ -164,12 +501,12 @@ def make_image(rng, flux):
     )
 
     im = gsim.array
-    im += rng.normal(scale=NOISE, size=im.shape)
+    im += rng.normal(scale=noise, size=im.shape)
     return im
 
 
-def make_obs(rng, flux):
-    im = make_image(rng=rng, flux=flux)
+def make_obs(rng, flux, noise):
+    im = make_image(rng=rng, flux=flux, noise=noise)
 
     cen = (np.array(im.shape) - 1.0) / 2.0
 
@@ -180,7 +517,7 @@ def make_obs(rng, flux):
     )
     return ngmix.Observation(
         image=im,
-        weight=im * 0 + 1.0 / NOISE ** 2,
+        weight=im * 0 + 1.0 / noise ** 2,
         jacobian=jac,
     )
 
@@ -201,10 +538,10 @@ def get_coellip_prior(rng, ngauss, scale, T_range=None, F_range=None):
         Fhe range for the prior on flux
     """
     if T_range is None:
-        T_range = [-1.0, 1.e3]
+        T_range = [-1.0, 1.0e3]
         # T_range = [0.05, 1.e3]
     if F_range is None:
-        F_range = [-100.0, 1.e9]
+        F_range = [-100.0, 1.0e9]
         # F_range = [0.05, 1.e9]
 
     g_prior = ngmix.priors.GPriorBA(sigma=0.5, rng=rng)
@@ -216,10 +553,14 @@ def get_coellip_prior(rng, ngauss, scale, T_range=None, F_range=None):
         rng=rng,
     )
     T_prior = ngmix.priors.FlatPrior(
-        minval=T_range[0], maxval=T_range[1], rng=rng,
+        minval=T_range[0],
+        maxval=T_range[1],
+        rng=rng,
     )
     F_prior = ngmix.priors.FlatPrior(
-        minval=F_range[0], maxval=F_range[1], rng=rng,
+        minval=F_range[0],
+        maxval=F_range[1],
+        rng=rng,
     )
 
     prior = ngmix.joint_prior.PriorCoellipSame(
@@ -249,19 +590,27 @@ def get_prior(rng, scale, T_range=None, F_range=None):
         Fhe range for the prior on flux
     """
     if T_range is None:
-        T_range = [-1.0, 1.e3]
+        T_range = [-1.0, 1.0e3]
     if F_range is None:
-        F_range = [-100.0, 1.e9]
+        F_range = [-100.0, 1.0e9]
 
     g_prior = ngmix.priors.GPriorBA(sigma=0.3, rng=rng)
     cen_prior = ngmix.priors.CenPrior(
-        cen1=0, cen2=0, sigma1=scale, sigma2=scale, rng=rng,
+        cen1=0,
+        cen2=0,
+        sigma1=scale,
+        sigma2=scale,
+        rng=rng,
     )
     T_prior = ngmix.priors.FlatPrior(
-        minval=T_range[0], maxval=T_range[1], rng=rng,
+        minval=T_range[0],
+        maxval=T_range[1],
+        rng=rng,
     )
     F_prior = ngmix.priors.FlatPrior(
-        minval=F_range[0], maxval=F_range[1], rng=rng,
+        minval=F_range[0],
+        maxval=F_range[1],
+        rng=rng,
     )
 
     prior = ngmix.joint_prior.PriorSimpleSep(
@@ -281,10 +630,12 @@ def get_runner(rng, submean=False):
     else:
         fitter = ngmix.fitting.Fitter(model='gauss', prior=prior)
     guesser = ngmix.guessers.SimplePSFGuesser(
-        rng=rng, guess_from_moms=True,
+        rng=rng,
+        guess_from_moms=True,
     )
     return ngmix.runners.Runner(
-        fitter=fitter, guesser=guesser,
+        fitter=fitter,
+        guesser=guesser,
         ntry=2,
     )
 
@@ -303,7 +654,8 @@ def get_coellip_runner(rng, ngauss, submean=False):
     guesser = ngmix.guessers.CoellipPSFGuesser(rng=rng, ngauss=ngauss)
 
     return ngmix.runners.Runner(
-        fitter=fitter, guesser=guesser,
+        fitter=fitter,
+        guesser=guesser,
         ntry=2,
     )
 
@@ -386,10 +738,17 @@ def do_em(obs, rng, ngauss):
     return bg, bg_err, bg_frac
 
 
-def do_trial_avg(rng, nobj, flux_min, flux_max, background, show=False):
-
+def do_trial_avg(
+    method,
+    nobj,
+    flux_min,
+    flux_max,
+    noise,
+    background,
+    rng,
+    show=False,
+):
     for i in range(nobj):
-
         tcat = make_cat()
 
         log_flux_true = rng.uniform(
@@ -397,11 +756,12 @@ def do_trial_avg(rng, nobj, flux_min, flux_max, background, show=False):
             np.log10(flux_max),
         )
 
-        tcat['flux_true'] = 10.0 ** log_flux_true
-        tobs = make_obs(rng=rng, flux=tcat['flux_true'])
+        tcat['flux_true'] = 10.0**log_flux_true
+        tobs = make_obs(rng=rng, flux=tcat['flux_true'], noise=noise)
 
         with tobs.writeable():
-            tobs.image += background * PIXEL_SCALE ** 2
+            # tobs.image += background * PIXEL_SCALE**2
+            tobs.image += background
 
         if i == 0:
             obstot = tobs
@@ -413,21 +773,29 @@ def do_trial_avg(rng, nobj, flux_min, flux_max, background, show=False):
     with obstot.writeable():
         obstot.image *= 1.0 / nobj
 
-    if True:
+    if method == 'fitsky':
+        runner = get_coellip_runner_with_sky(rng, ngauss=5)
+        res = runner.go(obstot)
+        bg = res['sky']
+        bg_err = res['sky_err']
+        bg_frac = bg * obstot.image.size / obstot.image.sum()
+    elif method == 'submean':
         # runner = get_runner(rng, submean=True)
         runner = get_coellip_runner(rng, submean=True, ngauss=5)
         res = runner.go(obstot)
         bg, bg_err, bg_frac = fit_for_background(obs=obstot, res=res)
-        bg *= 1 / PIXEL_SCALE ** 2
-        bg_err *= 1 / PIXEL_SCALE ** 2
-    else:
+        # bg *= 1 / PIXEL_SCALE**2
+        # bg_err *= 1 / PIXEL_SCALE**2
+    elif method == 'em':
         try:
             bg, bg_err, bg_frac = do_em(obs=obstot, rng=rng, ngauss=3)
-            bg *= 1 / PIXEL_SCALE ** 2
-            bg_err *= 1 / PIXEL_SCALE ** 2
+            # bg *= 1 / PIXEL_SCALE**2
+            # bg_err *= 1 / PIXEL_SCALE**2
         except ngmix.GMixRangeError as err:
             print(str(err))
             return None
+    else:
+        raise ValueError(f'Bad method name "{method}"')
 
     # bg = measure_edge_bg(obstot.image, width=2)
     return {
@@ -438,9 +806,11 @@ def do_trial_avg(rng, nobj, flux_min, flux_max, background, show=False):
 
 
 def plot_hist_results(results, background, plotfile):
-
     fig, axs = mplt.subplots(
-        nrows=2, ncols=2, figsize=(10, 8), layout='tight',
+        nrows=2,
+        ncols=2,
+        figsize=(10, 8),
+        layout='tight',
     )
 
     ax = axs[0, 0]
@@ -453,15 +823,20 @@ def plot_hist_results(results, background, plotfile):
     # bmean = results['background'].mean()
     # berr = results['background'].std() / np.sqrt(results.size)
 
-    x = 0.6
+    x = 0.5
     y = 0.9
     ax.text(
-        x, y, f'b mean: {bmean:.3f} +/- {berr:.3f}',
+        x,
+        y,
+        f'mean: {bmean:.3g} +/- {berr:.3g}',
         transform=ax.transAxes,
     )
 
     ax.hist(
-        results['background'], bins=50, color='C1', edgecolor='black',
+        results['background'],
+        bins=50,
+        color='C1',
+        edgecolor='black',
         alpha=0.5,
     )
     ax.axvline(background, color='red')
@@ -478,7 +853,9 @@ def plot_hist_results(results, background, plotfile):
     # fdiff_err = fdiff.std() / np.sqrt(results.size)
 
     ax.text(
-        x, y, f'mean: {fdiff_mean:.2f} +/- {fdiff_err:.2f}',
+        x,
+        y,
+        f'mean: {fdiff_mean:.3g} +/- {fdiff_err:.3g}',
         transform=ax.transAxes,
     )
 
@@ -502,11 +879,15 @@ def plot_hist_results(results, background, plotfile):
     # fdiff_err = fdiff_std / np.sqrt(results.size)
 
     ax.text(
-        x, y, f'mean: {fdiff_mean:.2f} +/- {fdiff_err:.2f}',
+        x,
+        y,
+        f'mean: {fdiff_mean:.3g} +/- {fdiff_err:.3g}',
         transform=ax.transAxes,
     )
     ax.text(
-        x, y - 0.05, f'std: {fdiff_std:.2f}',
+        x,
+        y - 0.05,
+        f'std: {fdiff_std:.3g}',
         transform=ax.transAxes,
     )
 
@@ -523,8 +904,9 @@ def plot_hist_results(results, background, plotfile):
     )
 
     ax.text(
-        x - 0.1, y,
-        rf'bfrac mean: {bfrac_mean:.3f} +/- {bfrac_err:.3f}',
+        x,
+        y,
+        rf'bfrac mean: {bfrac_mean:.3g} +/- {bfrac_err:.3g}',
         transform=ax.transAxes,
     )
 
@@ -551,20 +933,31 @@ def make_result(n=1):
     return np.zeros(n, dtype=dtype)
 
 
-def main(ntrial, nper, flux_min, flux_max, background, plotfile, show):
-
-    rng = np.random.RandomState()
+def main(
+    method,
+    ntrial,
+    nper,
+    flux_min,
+    flux_max,
+    noise,
+    background,
+    plotfile,
+    seed,
+    show,
+):
+    rng = np.random.RandomState(seed)
 
     dlist = []
     for i in trange(ntrial):
-
         tres = make_result()
         res = do_trial_avg(
-            rng=rng,
+            method=method,
             nobj=nper,
             flux_min=flux_min,
             flux_max=flux_max,
+            noise=noise,
             background=background,
+            rng=rng,
             show=show,
         )
         if res is None:
@@ -586,17 +979,22 @@ def main(ntrial, nper, flux_min, flux_max, background, plotfile, show):
 
 def get_args():
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--plotfile', required=True)
     parser.add_argument('--ntrial', type=int, default=1000)
+    parser.add_argument('--seed', type=int)
+    parser.add_argument('--method', default='fitsky')
     parser.add_argument('--nper', type=int, default=100)
     parser.add_argument('--flux-min', type=float, default=320)
     parser.add_argument('--flux-max', type=float, default=3500)
+    parser.add_argument('--noise', type=float, default=1)
     parser.add_argument(
         '--background',
         type=float,
-        default=0.025,
-        help='background per arcsecond squared',
+        default=0.001,
+        # help='background per arcsecond squared',
+        help='background value',
     )
     parser.add_argument('--show', action='store_true')
     return parser.parse_args()
@@ -605,11 +1003,14 @@ def get_args():
 if __name__ == '__main__':
     args = get_args()
     main(
-        plotfile=args.plotfile,
+        method=args.method,
         ntrial=args.ntrial,
+        seed=args.seed,
         nper=args.nper,
         flux_min=args.flux_min,
         flux_max=args.flux_max,
+        noise=args.noise,
         background=args.background,
+        plotfile=args.plotfile,
         show=args.show,
     )
