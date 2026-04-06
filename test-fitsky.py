@@ -263,7 +263,15 @@ class FitSkyCoellipFitModel(ngmix.fitting.results.CoellipFitModel):
             self.n_prior_pars = 1 + 1 + 1 + ngauss + ngauss + 1
 
 
-def get_coellip_with_sky_prior(rng, ngauss, scale, T_range=None, F_range=None):
+def get_coellip_with_sky_prior(
+    rng,
+    ngauss,
+    scale,
+    # background,
+    noise,
+    T_range=None,
+    F_range=None,
+):
     """
     get a prior for use with the maximum likelihood fitter
 
@@ -304,7 +312,15 @@ def get_coellip_with_sky_prior(rng, ngauss, scale, T_range=None, F_range=None):
         rng=rng,
     )
 
-    sky_prior = ngmix.priors.Normal(mean=0, sigma=0.1, rng=rng)
+    sky_prior = ngmix.priors.Normal(
+        mean=0,
+        sigma=noise,
+        # mean=0,
+        # sigma=2 * abs(background),
+        # mean=background,
+        # sigma=0.1 * background,
+        rng=rng,
+    )
 
     prior = PriorCoellipWithSky(
         ngauss=ngauss,
@@ -347,10 +363,19 @@ class FitSkyCoellipPSFGuesser(ngmix.guessers.CoellipPSFGuesser):
         return guess
 
 
-def get_coellip_runner_with_sky(rng, ngauss):
+def get_coellip_runner_with_sky(
+    rng,
+    ngauss,
+    # background,
+    noise,
+):
     # prior = None
     prior = get_coellip_with_sky_prior(
-        ngauss=ngauss, rng=rng, scale=PIXEL_SCALE,
+        ngauss=ngauss,
+        rng=rng,
+        scale=PIXEL_SCALE,
+        # background=background,
+        noise=noise,
     )
 
     fitter = FitSkyCoellipFitter(ngauss=ngauss, prior=prior)
@@ -774,7 +799,12 @@ def do_trial_avg(
         obstot.image *= 1.0 / nobj
 
     if method == 'fitsky':
-        runner = get_coellip_runner_with_sky(rng, ngauss=5)
+        runner = get_coellip_runner_with_sky(
+            rng,
+            ngauss=5,
+            # background=background,
+            noise=noise,
+        )
         res = runner.go(obstot)
         bg = res['sky']
         bg_err = res['sky_err']
@@ -992,8 +1022,7 @@ def get_args():
     parser.add_argument(
         '--background',
         type=float,
-        default=0.001,
-        # help='background per arcsecond squared',
+        default=-0.3,
         help='background value',
     )
     parser.add_argument('--show', action='store_true')
