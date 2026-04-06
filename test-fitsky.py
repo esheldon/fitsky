@@ -14,7 +14,7 @@ import esutil as eu
 
 PIXEL_SCALE = 0.2
 STAMP_SIZE = 51
-FWHM = 0.7
+FWHM = 0.8
 # NOISE = 1.0
 # NOISE = 0.00001
 # NOISE = 0.01
@@ -843,6 +843,7 @@ def plot_hist_results(results, background, plotfile):
         layout='tight',
     )
 
+    nbins = 50
     ax = axs[0, 0]
     ax.set(xlabel=r'$b$')
 
@@ -864,7 +865,7 @@ def plot_hist_results(results, background, plotfile):
 
     ax.hist(
         results['background'],
-        bins=50,
+        bins=np.linspace(bmean - 4 * bstd, bmean + 4 * bstd, nbins),
         color='C1',
         edgecolor='black',
         alpha=0.5,
@@ -889,7 +890,14 @@ def plot_hist_results(results, background, plotfile):
         transform=ax.transAxes,
     )
 
-    ax.hist(fdiff, bins=50, color='C1', edgecolor='black', alpha=0.5)
+    ax.hist(
+        fdiff,
+        # bins=nbins,
+        bins=np.linspace(
+            fdiff_mean - 4 * fdiff_std, fdiff_mean + 4 * fdiff_std, nbins,
+        ),
+        color='C1', edgecolor='black', alpha=0.5,
+    )
 
     ax = axs[1, 0]
     ax.set(
@@ -921,14 +929,23 @@ def plot_hist_results(results, background, plotfile):
         transform=ax.transAxes,
     )
 
-    ax.hist(fdiff, bins=50, color='C1', edgecolor='black', alpha=0.5)
+    ax.hist(
+        fdiff,
+        # bins=nbins,
+        bins=np.linspace(
+            fdiff_mean - 4 * fdiff_std, fdiff_mean + 4 * fdiff_std, nbins,
+        ),
+        color='C1',
+        edgecolor='black',
+        alpha=0.5,
+    )
 
     ax = axs[1, 1]
     ax.set(xlabel=r'$b_{\mathrm{frac}}$')
 
     # bfrac_mean = results['background_frac'].mean()
     # bfrac_err = results['background_frac'].std() / np.sqrt(results.size)
-    bfrac_mean, _, bfrac_err = eu.stat.sigma_clip(
+    bfrac_mean, bfrac_std, bfrac_err = eu.stat.sigma_clip(
         results['background_frac'],
         get_err=True,
     )
@@ -942,7 +959,11 @@ def plot_hist_results(results, background, plotfile):
 
     ax.hist(
         results['background_frac'],
-        bins=50,
+        # bins=nbins,
+        bins=np.linspace(
+            bfrac_mean - 4 * bfrac_std, bfrac_mean + 4 * bfrac_std, nbins,
+        ),
+
         color='C1',
         edgecolor='black',
         alpha=0.5,
