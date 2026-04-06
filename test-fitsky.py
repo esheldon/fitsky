@@ -13,7 +13,7 @@ from tqdm import trange
 import esutil as eu
 
 PIXEL_SCALE = 0.2
-STAMP_SIZE = 51
+STAMP_SIZE = 31
 FWHM_MEAN = 0.8
 FWHM_SIGMA = 0.1
 FWHM_MIN = 0.65
