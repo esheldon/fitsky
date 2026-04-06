@@ -13,7 +13,6 @@ from tqdm import trange
 import esutil as eu
 
 PIXEL_SCALE = 0.2
-STAMP_SIZE = 31
 FWHM_MEAN = 0.8
 FWHM_SIGMA = 0.1
 FWHM_MIN = 0.65
@@ -544,13 +543,13 @@ def make_obj(flux, fwhm, e1, e2):
     )
 
 
-def make_image(rng, fwhm, e1, e2, flux, noise):
+def make_image(rng, fwhm, e1, e2, flux, stamp_size, noise):
     obj = make_obj(flux=flux, e1=e1, e2=e2, fwhm=fwhm)
 
     offset = rng.uniform(low=-0.5, high=0.5, size=2)
     gsim = obj.drawImage(
-        nx=STAMP_SIZE,
-        ny=STAMP_SIZE,
+        nx=stamp_size,
+        ny=stamp_size,
         scale=PIXEL_SCALE,
         offset=offset,
         # method='no_pixel',
@@ -561,13 +560,14 @@ def make_image(rng, fwhm, e1, e2, flux, noise):
     return im
 
 
-def make_obs(rng, fwhm, e1, e2, flux, noise):
+def make_obs(rng, fwhm, e1, e2, flux, stamp_size, noise):
     im = make_image(
         rng=rng,
         fwhm=fwhm,
         e1=e1,
         e2=e2,
         flux=flux,
+        stamp_size=stamp_size,
         noise=noise,
     )
 
@@ -811,6 +811,7 @@ def do_trial_avg(
     flux_max,
     noise,
     background,
+    stamp_size,
     rng,
     show=False,
 ):
@@ -829,6 +830,7 @@ def do_trial_avg(
             fwhm=fwhm,
             e1=e1,
             e2=e2,
+            stamp_size=stamp_size,
             noise=noise,
         )
 
@@ -1038,6 +1040,7 @@ def main(
     nper,
     flux_min,
     flux_max,
+    stamp_size,
     noise,
     background,
     plotfile,
@@ -1059,6 +1062,7 @@ def main(
             fwhm=fwhm,
             e1=e2,
             e2=e2,
+            stamp_size=stamp_size,
             flux_min=flux_min,
             flux_max=flux_max,
             noise=noise,
@@ -1094,6 +1098,7 @@ def get_args():
     parser.add_argument('--nper', type=int, default=100)
     parser.add_argument('--flux-min', type=float, default=320)
     parser.add_argument('--flux-max', type=float, default=3500)
+    parser.add_argument('--stamp-size', type=int, default=31)
     parser.add_argument('--noise', type=float, default=1)
     parser.add_argument(
         '--background',
@@ -1114,6 +1119,7 @@ if __name__ == '__main__':
         nper=args.nper,
         flux_min=args.flux_min,
         flux_max=args.flux_max,
+        stamp_size=args.stamp_size,
         noise=args.noise,
         background=args.background,
         plotfile=args.plotfile,
