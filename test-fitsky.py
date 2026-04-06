@@ -14,10 +14,35 @@ import esutil as eu
 
 PIXEL_SCALE = 0.2
 STAMP_SIZE = 51
-FWHM = 0.8
+FWHM_MEAN = 0.8
+FWHM_SIGMA = 0.1
+FWHM_MIN = 0.65
+E_SIGMA = 0.03
+
 # NOISE = 1.0
 # NOISE = 0.00001
 # NOISE = 0.01
+
+
+def get_fwhm(rng):
+    p = ngmix.priors.LogNormal(mean=FWHM_MEAN, sigma=FWHM_SIGMA, rng=rng)
+
+    while True:
+        fwhm = p.sample()
+        if fwhm > FWHM_MIN:
+            break
+
+    return fwhm
+
+
+def get_e1e2(rng):
+    while True:
+        e1, e2 = rng.normal(scale=E_SIGMA, size=2)
+        e = np.sqrt(e1 ** 2 + e2 ** 2)
+        if e < 0.99:
+            break
+
+    return e1, e2
 
 
 @njit
@@ -508,13 +533,19 @@ class SubMeanFitModel(ngmix.fitting.results.FitModel):
         return fdiff
 
 
-def make_obj(flux):
-    return galsim.Moffat(fwhm=FWHM, flux=flux, beta=3.5)
-    # return galsim.Gaussian(fwhm=FWHM, flux=flux)
+def make_obj(flux, fwhm, e1, e2):
+    return galsim.Moffat(
+        fwhm=fwhm,
+        flux=flux,
+        beta=3.5,
+    ).shear(
+        e1=e1,
+        e2=e2,
+    )
 
 
-def make_image(rng, flux, noise):
-    obj = make_obj(flux)
+def make_image(rng, fwhm, e1, e2, flux, noise):
+    obj = make_obj(flux=flux, e1=e1, e2=e2, fwhm=fwhm)
 
     offset = rng.uniform(low=-0.5, high=0.5, size=2)
     gsim = obj.drawImage(
@@ -530,8 +561,15 @@ def make_image(rng, flux, noise):
     return im
 
 
-def make_obs(rng, flux, noise):
-    im = make_image(rng=rng, flux=flux, noise=noise)
+def make_obs(rng, fwhm, e1, e2, flux, noise):
+    im = make_image(
+        rng=rng,
+        fwhm=fwhm,
+        e1=e1,
+        e2=e2,
+        flux=flux,
+        noise=noise,
+    )
 
     cen = (np.array(im.shape) - 1.0) / 2.0
 
@@ -766,6 +804,9 @@ def do_em(obs, rng, ngauss):
 def do_trial_avg(
     method,
     nobj,
+    fwhm,
+    e1,
+    e2,
     flux_min,
     flux_max,
     noise,
@@ -782,7 +823,14 @@ def do_trial_avg(
         )
 
         tcat['flux_true'] = 10.0**log_flux_true
-        tobs = make_obs(rng=rng, flux=tcat['flux_true'], noise=noise)
+        tobs = make_obs(
+            rng=rng,
+            flux=tcat['flux_true'],
+            fwhm=fwhm,
+            e1=e1,
+            e2=e2,
+            noise=noise,
+        )
 
         with tobs.writeable():
             # tobs.image += background * PIXEL_SCALE**2
@@ -1001,9 +1049,16 @@ def main(
     dlist = []
     for i in trange(ntrial):
         tres = make_result()
+
+        fwhm = get_fwhm(rng)
+        e1, e2 = get_e1e2(rng)
+
         res = do_trial_avg(
             method=method,
             nobj=nper,
+            fwhm=fwhm,
+            e1=e2,
+            e2=e2,
             flux_min=flux_min,
             flux_max=flux_max,
             noise=noise,
