@@ -44,20 +44,6 @@ def get_e1e2(rng):
     return e1, e2
 
 
-@njit
-def measure_edge_bg(image, width):
-    nrows, ncols = image.shape
-
-    bsum = 0.0
-    for row in range(nrows):
-        if width <= row < nrows - width:
-            for col in range(ncols):
-                if width <= col < ncols - width:
-                    bsum += image[row, col]
-
-    return bsum / image.size
-
-
 class PriorCoellipWithSky(ngmix.joint_prior.PriorSimpleSep):
     def __init__(
         self, ngauss, cen_prior, g_prior, T_prior, F_prior, sky_prior
@@ -764,8 +750,29 @@ def fit_for_background(obs, res):
     return bg, bg_err, bg_frac
 
 
+def prep_obs(obs):
+    noise = np.sqrt(1.0 / np.median(obs.weight))
+    im = obs.image.copy()
+
+    # need no zero pixels and sky value
+    im_min = im.min()
+
+    desired_minval = 0.001 * noise
+
+    sky = desired_minval - im_min
+    im += sky
+
+    newobs = ngmix.Observation(
+        im,
+        jacobian=obs.jacobian,
+    )
+
+    return newobs, sky
+
+
 def do_em(obs, rng, ngauss):
-    obs_with_sky, sky = ngmix.em.prep_obs(obs)
+    # obs_with_sky, sky = ngmix.em.prep_obs(obs)
+    obs_with_sky, sky = prep_obs(obs)
 
     fitter = ngmix.em.EMFitter(
         maxiter=5000,
@@ -868,7 +875,7 @@ def do_trial_avg(
         # bg_err *= 1 / PIXEL_SCALE**2
     elif method == 'em':
         try:
-            bg, bg_err, bg_frac = do_em(obs=obstot, rng=rng, ngauss=3)
+            bg, bg_err, bg_frac = do_em(obs=obstot, rng=rng, ngauss=5)
             # bg *= 1 / PIXEL_SCALE**2
             # bg_err *= 1 / PIXEL_SCALE**2
         except ngmix.GMixRangeError as err:
@@ -877,7 +884,6 @@ def do_trial_avg(
     else:
         raise ValueError(f'Bad method name "{method}"')
 
-    # bg = measure_edge_bg(obstot.image, width=2)
     return {
         'bg': bg,
         'bg_err': bg_err,
