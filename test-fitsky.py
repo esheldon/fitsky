@@ -921,7 +921,8 @@ def plot_hist_results(results, background, plotfile):
 
     ax.hist(
         results['background'],
-        bins=np.linspace(bmean - 4 * bstd, bmean + 4 * bstd, nbins),
+        bins=nbins,
+        # bins=np.linspace(bmean - 4 * bstd, bmean + 4 * bstd, nbins),
         color='C1',
         edgecolor='black',
         alpha=0.5,
@@ -948,10 +949,10 @@ def plot_hist_results(results, background, plotfile):
 
     ax.hist(
         fdiff,
-        # bins=nbins,
-        bins=np.linspace(
-            fdiff_mean - 4 * fdiff_std, fdiff_mean + 4 * fdiff_std, nbins,
-        ),
+        bins=nbins,
+        # bins=np.linspace(
+        #    fdiff_mean - 4 * fdiff_std, fdiff_mean + 4 * fdiff_std, nbins,
+        # ),
         color='C1', edgecolor='black', alpha=0.5,
     )
 
@@ -988,10 +989,10 @@ def plot_hist_results(results, background, plotfile):
 
     ax.hist(
         fdiff,
-        # bins=nbins,
-        bins=np.linspace(
-            fdiff_mean - 4 * fdiff_std, fdiff_mean + 4 * fdiff_std, nbins,
-        ),
+        bins=nbins,
+        # bins=np.linspace(
+        #     fdiff_mean - 4 * fdiff_std, fdiff_mean + 4 * fdiff_std, nbins,
+        # ),
         color='C1',
         edgecolor='black',
         alpha=0.5,
@@ -1016,11 +1017,10 @@ def plot_hist_results(results, background, plotfile):
 
     ax.hist(
         results['background_frac'],
-        # bins=nbins,
-        bins=np.linspace(
-            bfrac_mean - 4 * bfrac_std, bfrac_mean + 4 * bfrac_std, nbins,
-        ),
-
+        bins=nbins,
+        # bins=np.linspace(
+        #     bfrac_mean - 4 * bfrac_std, bfrac_mean + 4 * bfrac_std, nbins,
+        # ),
         color='C1',
         edgecolor='black',
         alpha=0.5,
