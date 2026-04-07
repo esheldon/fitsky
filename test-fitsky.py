@@ -870,90 +870,6 @@ def fit_stack(
     }
 
 
-def do_trial_leave(
-    method,
-    nobj,
-    fwhm,
-    e1,
-    e2,
-    flux_min,
-    flux_max,
-    noise,
-    background,
-    stamp_size,
-    rng,
-    show=False,
-):
-
-    dlist = []
-    for i in range(nobj):
-        tcat = make_cat()
-
-        log_flux_true = rng.uniform(
-            np.log10(flux_min),
-            np.log10(flux_max),
-        )
-
-        tcat['flux_true'] = 10.0**log_flux_true
-        tobs = make_obs(
-            rng=rng,
-            flux=tcat['flux_true'],
-            fwhm=fwhm,
-            e1=e1,
-            e2=e2,
-            stamp_size=stamp_size,
-            noise=noise,
-        )
-
-        with tobs.writeable():
-            # tobs.image += background * PIXEL_SCALE**2
-            tobs.image += background
-
-        if i == 0:
-            obs_sum = tobs.copy()
-        else:
-            with obs_sum.writeable():
-                obs_sum.image += tobs.image
-                obs_sum.weight += tobs.weight
-
-        dlist.append(tobs)
-
-    keep = np.zeros(nobj, dtype=bool)
-    bgs = np.zeros(nobj)
-    bg_errs = np.zeros(nobj)
-    bg_fracs = np.zeros(nobj)
-
-    for ileave in range(nobj):
-        obstot = obs_sum.copy()
-
-        tobs = dlist[ileave]
-        with obstot.writeable():
-            obstot.image -= tobs.image
-            obstot.weight -= tobs.weight
-
-        with obstot.writeable():
-            obstot.image *= 1.0 / (nobj - 1)
-
-        res = fit_stack(obs=obstot, method=method, noise=noise, rng=rng)
-
-        keep[ileave] = True
-        bgs[ileave] = res['bg']
-        bg_errs[ileave] = res['bg_err']
-        bg_fracs[ileave] = res['bg_frac']
-
-    bg, bg_err, _ = eu.stat.sigma_clip(
-        bgs,
-        get_err=True,
-    )
-    bg_frac = np.median(bg_fracs)
-
-    return {
-        'bg': bg,
-        'bg_err': bg_err,
-        'bg_frac': bg_frac,
-    }
-
-
 def simulate_stack(
     nobj,
     fwhm,
@@ -999,50 +915,6 @@ def simulate_stack(
         obstot.image *= 1.0 / nobj
 
     return obstot
-
-
-def do_trial_avg(
-    method,
-    nobj,
-    fwhm,
-    e1,
-    e2,
-    flux_min,
-    flux_max,
-    noise,
-    background,
-    stamp_size,
-    rng,
-    sky_prior_mean=0.0,
-    sky_prior_sigma=None,
-    obstot=None,
-    show=False,
-):
-
-    if obstot is None:
-        obstot = simulate_stack(
-            nobj=nobj,
-            fwhm=fwhm,
-            e1=e2,
-            e2=e2,
-            stamp_size=stamp_size,
-            flux_min=flux_min,
-            flux_max=flux_max,
-            noise=noise,
-            background=background,
-            rng=rng,
-
-        )
-
-    res = fit_stack(
-        obs=obstot,
-        method=method,
-        noise=noise,
-        rng=rng,
-        sky_prior_mean=sky_prior_mean,
-        sky_prior_sigma=sky_prior_sigma,
-    )
-    return res, obstot
 
 
 def get_nbins(data, std):
@@ -1227,24 +1099,6 @@ def main(
         dlist = []
         for i in trange(ntrial, ascii=True, ncols=70):
 
-            # fwhm = get_fwhm(rng)
-            # e1, e2 = get_e1e2(rng)
-
-            # obstot = simulate_stack(
-            #     nobj=nper,
-            #     fwhm=fwhm,
-            #     e1=e2,
-            #     e2=e2,
-            #     stamp_size=stamp_size,
-            #     flux_min=flux_min,
-            #     flux_max=flux_max,
-            #     noise=noise,
-            #     background=background,
-            #     rng=rng,
-            #
-            # )
-            # if npass == 2:
-            #     observations.append(obstot)
             obstot = observations[i]
 
             res = fit_stack(
@@ -1264,7 +1118,6 @@ def main(
             bg = res['bg']
             bg_err = res['bg_err']
             tres['bg_frac'] = res['bg_frac']
-            # print(res['bg_frac'])
 
             tres['bg'] = bg
             tres['bg_err'] = bg_err
@@ -1274,61 +1127,7 @@ def main(
         results = eu.numpy_util.combine_arrlist(dlist)
         if npass == 2:
             sky_prior_mean, sky_prior_sigma = eu.stat.sigma_clip(results['bg'])
-            # sky_prior_sigma *= np.sqrt(2)
 
-    plot_hist_results(results, background, plotfile=plotfile)
-
-
-def main_orig(
-    method,
-    ntrial,
-    nper,
-    flux_min,
-    flux_max,
-    stamp_size,
-    noise,
-    background,
-    plotfile,
-    seed,
-    show,
-):
-    rng = np.random.RandomState(seed)
-
-    dlist = []
-    for i in trange(ntrial, ascii=True, ncols=70):
-        tres = make_result()
-
-        fwhm = get_fwhm(rng)
-        e1, e2 = get_e1e2(rng)
-
-        res, obstot = do_trial_avg(
-            method=method,
-            nobj=nper,
-            fwhm=fwhm,
-            e1=e2,
-            e2=e2,
-            stamp_size=stamp_size,
-            flux_min=flux_min,
-            flux_max=flux_max,
-            noise=noise,
-            background=background,
-            rng=rng,
-            show=show,
-        )
-        if res is None:
-            continue
-
-        bg = res['bg']
-        bg_err = res['bg_err']
-        tres['bg_frac'] = res['bg_frac']
-        # print(res['bg_frac'])
-
-        tres['bg'] = bg
-        tres['bg_err'] = bg_err
-
-        dlist.append(tres)
-
-    results = eu.numpy_util.combine_arrlist(dlist)
     plot_hist_results(results, background, plotfile=plotfile)
 
 
