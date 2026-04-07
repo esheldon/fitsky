@@ -277,8 +277,8 @@ def get_coellip_with_sky_prior(
     rng,
     ngauss,
     scale,
-    # background,
-    noise,
+    sky_prior_mean,
+    sky_prior_sigma,
     T_range=None,
     F_range=None,
 ):
@@ -323,8 +323,8 @@ def get_coellip_with_sky_prior(
     )
 
     sky_prior = ngmix.priors.Normal(
-        mean=0,
-        sigma=noise,
+        mean=sky_prior_mean,
+        sigma=sky_prior_sigma,
         # mean=0,
         # sigma=2 * abs(background),
         # mean=background,
@@ -376,16 +376,16 @@ class FitSkyCoellipPSFGuesser(ngmix.guessers.CoellipPSFGuesser):
 def get_coellip_runner_with_sky(
     rng,
     ngauss,
-    # background,
-    noise,
+    sky_prior_mean,
+    sky_prior_sigma,
 ):
     # prior = None
     prior = get_coellip_with_sky_prior(
         ngauss=ngauss,
         rng=rng,
         scale=PIXEL_SCALE,
-        # background=background,
-        noise=noise,
+        sky_prior_mean=sky_prior_mean,
+        sky_prior_sigma=sky_prior_sigma,
     )
 
     fitter = FitSkyCoellipFitter(ngauss=ngauss, prior=prior)
@@ -743,7 +743,14 @@ def fit_for_background(obs, res):
     # compare_images(obs.image, im)
 
     imdiff = obs.image - im
+
+    # bg, _, bg_err = eu.stat.sigma_clip(
+    #     imdiff.ravel(),
+    #     get_err=True,
+    # )
+
     bg = imdiff.mean()
+    # bg = np.median(imdiff)
     bg_err = imdiff.std() / np.sqrt(im.size)
 
     bg_frac = bg * obs.image.size / obs.image.sum()
@@ -808,7 +815,62 @@ def do_em(obs, rng, ngauss):
     return bg, bg_err, bg_frac
 
 
-def do_trial_avg(
+def fit_stack(
+    obs, method, noise, rng, sky_prior_mean=0.0, sky_prior_sigma=None,
+):
+    if sky_prior_sigma is None:
+        sky_prior_sigma = noise
+
+    if method == 'fitsky':
+        runner = get_coellip_runner_with_sky(
+            rng,
+            ngauss=5,
+            sky_prior_mean=sky_prior_mean,
+            sky_prior_sigma=sky_prior_sigma,
+        )
+        res = runner.go(obs)
+        bg = res['sky']
+        bg_err = res['sky_err']
+        bg_frac = bg * obs.image.size / obs.image.sum()
+    elif method == 'submean':
+        # runner = get_runner(rng, submean=True)
+        runner = get_coellip_runner(rng, submean=True, ngauss=5)
+        res = runner.go(obs)
+        bg, bg_err, bg_frac = fit_for_background(obs=obs, res=res)
+        # bg *= 1 / PIXEL_SCALE**2
+        # bg_err *= 1 / PIXEL_SCALE**2
+    elif 'em' in method:
+        try:
+            bg, bg_err, bg_frac = do_em(obs=obs, rng=rng, ngauss=5)
+            # bg *= 1 / PIXEL_SCALE**2
+            # bg_err *= 1 / PIXEL_SCALE**2
+        except ngmix.GMixRangeError as err:
+            print(str(err))
+            return None
+
+        if method == 'emhybrid':
+            runner = get_coellip_runner_with_sky(
+                rng,
+                ngauss=5,
+                sky_prior_mean=bg,
+                sky_prior_sigma=bg_err * 10,
+            )
+            res = runner.go(obs)
+            bg = res['sky']
+            bg_err = res['sky_err']
+            bg_frac = bg * obs.image.size / obs.image.sum()
+
+    else:
+        raise ValueError(f'Bad method name "{method}"')
+
+    return {
+        'bg': bg,
+        'bg_err': bg_err,
+        'bg_frac': bg_frac,
+    }
+
+
+def do_trial_leave(
     method,
     nobj,
     fwhm,
@@ -822,6 +884,8 @@ def do_trial_avg(
     rng,
     show=False,
 ):
+
+    dlist = []
     for i in range(nobj):
         tcat = make_cat()
 
@@ -846,6 +910,85 @@ def do_trial_avg(
             tobs.image += background
 
         if i == 0:
+            obs_sum = tobs.copy()
+        else:
+            with obs_sum.writeable():
+                obs_sum.image += tobs.image
+                obs_sum.weight += tobs.weight
+
+        dlist.append(tobs)
+
+    keep = np.zeros(nobj, dtype=bool)
+    bgs = np.zeros(nobj)
+    bg_errs = np.zeros(nobj)
+    bg_fracs = np.zeros(nobj)
+
+    for ileave in range(nobj):
+        obstot = obs_sum.copy()
+
+        tobs = dlist[ileave]
+        with obstot.writeable():
+            obstot.image -= tobs.image
+            obstot.weight -= tobs.weight
+
+        with obstot.writeable():
+            obstot.image *= 1.0 / (nobj - 1)
+
+        res = fit_stack(obs=obstot, method=method, noise=noise, rng=rng)
+
+        keep[ileave] = True
+        bgs[ileave] = res['bg']
+        bg_errs[ileave] = res['bg_err']
+        bg_fracs[ileave] = res['bg_frac']
+
+    bg, bg_err, _ = eu.stat.sigma_clip(
+        bgs,
+        get_err=True,
+    )
+    bg_frac = np.median(bg_fracs)
+
+    return {
+        'bg': bg,
+        'bg_err': bg_err,
+        'bg_frac': bg_frac,
+    }
+
+
+def simulate_stack(
+    nobj,
+    fwhm,
+    e1,
+    e2,
+    flux_min,
+    flux_max,
+    noise,
+    background,
+    stamp_size,
+    rng,
+):
+    for i in range(nobj):
+        tcat = make_cat()
+
+        log_flux_true = rng.uniform(
+            np.log10(flux_min),
+            np.log10(flux_max),
+        )
+
+        tcat['flux_true'] = 10.0**log_flux_true
+        tobs = make_obs(
+            rng=rng,
+            flux=tcat['flux_true'],
+            fwhm=fwhm,
+            e1=e1,
+            e2=e2,
+            stamp_size=stamp_size,
+            noise=noise,
+        )
+
+        with tobs.writeable():
+            tobs.image += background
+
+        if i == 0:
             obstot = tobs
         else:
             with obstot.writeable():
@@ -855,40 +998,56 @@ def do_trial_avg(
     with obstot.writeable():
         obstot.image *= 1.0 / nobj
 
-    if method == 'fitsky':
-        runner = get_coellip_runner_with_sky(
-            rng,
-            ngauss=5,
-            # background=background,
-            noise=noise,
-        )
-        res = runner.go(obstot)
-        bg = res['sky']
-        bg_err = res['sky_err']
-        bg_frac = bg * obstot.image.size / obstot.image.sum()
-    elif method == 'submean':
-        # runner = get_runner(rng, submean=True)
-        runner = get_coellip_runner(rng, submean=True, ngauss=5)
-        res = runner.go(obstot)
-        bg, bg_err, bg_frac = fit_for_background(obs=obstot, res=res)
-        # bg *= 1 / PIXEL_SCALE**2
-        # bg_err *= 1 / PIXEL_SCALE**2
-    elif method == 'em':
-        try:
-            bg, bg_err, bg_frac = do_em(obs=obstot, rng=rng, ngauss=5)
-            # bg *= 1 / PIXEL_SCALE**2
-            # bg_err *= 1 / PIXEL_SCALE**2
-        except ngmix.GMixRangeError as err:
-            print(str(err))
-            return None
-    else:
-        raise ValueError(f'Bad method name "{method}"')
+    return obstot
 
-    return {
-        'bg': bg,
-        'bg_err': bg_err,
-        'bg_frac': bg_frac,
-    }
+
+def do_trial_avg(
+    method,
+    nobj,
+    fwhm,
+    e1,
+    e2,
+    flux_min,
+    flux_max,
+    noise,
+    background,
+    stamp_size,
+    rng,
+    sky_prior_mean=0.0,
+    sky_prior_sigma=None,
+    obstot=None,
+    show=False,
+):
+
+    if obstot is None:
+        obstot = simulate_stack(
+            nobj=nobj,
+            fwhm=fwhm,
+            e1=e2,
+            e2=e2,
+            stamp_size=stamp_size,
+            flux_min=flux_min,
+            flux_max=flux_max,
+            noise=noise,
+            background=background,
+            rng=rng,
+
+        )
+
+    res = fit_stack(
+        obs=obstot,
+        method=method,
+        noise=noise,
+        rng=rng,
+        sky_prior_mean=sky_prior_mean,
+        sky_prior_sigma=sky_prior_sigma,
+    )
+    return res, obstot
+
+
+def get_nbins(data, std):
+    binsize = 0.3 * std
+    return int((data.max() - data.min()) / binsize)
 
 
 def plot_hist_results(results, background, plotfile):
@@ -899,16 +1058,13 @@ def plot_hist_results(results, background, plotfile):
         layout='tight',
     )
 
-    nbins = 50
     ax = axs[0, 0]
     ax.set(xlabel=r'$b$')
 
     bmean, bstd, berr = eu.stat.sigma_clip(
-        results['background'],
+        results['bg'],
         get_err=True,
     )
-    # bmean = results['background'].mean()
-    # berr = results['background'].std() / np.sqrt(results.size)
 
     x = 0.5
     y = 0.9
@@ -920,9 +1076,8 @@ def plot_hist_results(results, background, plotfile):
     )
 
     ax.hist(
-        results['background'],
-        bins=nbins,
-        # bins=np.linspace(bmean - 4 * bstd, bmean + 4 * bstd, nbins),
+        results['bg'],
+        bins=get_nbins(results['bg'], bstd),
         color='C1',
         edgecolor='black',
         alpha=0.5,
@@ -932,13 +1087,11 @@ def plot_hist_results(results, background, plotfile):
     ax = axs[0, 1]
     ax.set(xlabel=r'$(b - b_{\mathrm{true}}) / b_{\mathrm{true}}$')
 
-    fdiff = results['background'] / background - 1
+    fdiff = results['bg'] / background - 1
     fdiff_mean, fdiff_std, fdiff_err = eu.stat.sigma_clip(
         fdiff,
         get_err=True,
     )
-    # fdiff_mean = fdiff.mean()
-    # fdiff_err = fdiff.std() / np.sqrt(results.size)
 
     ax.text(
         x,
@@ -949,10 +1102,7 @@ def plot_hist_results(results, background, plotfile):
 
     ax.hist(
         fdiff,
-        bins=nbins,
-        # bins=np.linspace(
-        #    fdiff_mean - 4 * fdiff_std, fdiff_mean + 4 * fdiff_std, nbins,
-        # ),
+        bins=get_nbins(fdiff, fdiff_std),
         color='C1', edgecolor='black', alpha=0.5,
     )
 
@@ -961,18 +1111,13 @@ def plot_hist_results(results, background, plotfile):
         xlabel=r'$(b - b_{\mathrm{true}}) / \sigma$',
     )
 
-    # mean_err = results['background_err'].mean()
-    mean_err = np.median(results['background_err'])
-    fdiff = (results['background'] - background) / mean_err
+    mean_err = np.median(results['bg_err'])
+    fdiff = (results['bg'] - background) / mean_err
 
     fdiff_mean, fdiff_std, fdiff_err = eu.stat.sigma_clip(
         fdiff,
         get_err=True,
     )
-
-    # fdiff_mean = fdiff.mean()
-    # fdiff_std = fdiff.std()
-    # fdiff_err = fdiff_std / np.sqrt(results.size)
 
     ax.text(
         x,
@@ -989,10 +1134,7 @@ def plot_hist_results(results, background, plotfile):
 
     ax.hist(
         fdiff,
-        bins=nbins,
-        # bins=np.linspace(
-        #     fdiff_mean - 4 * fdiff_std, fdiff_mean + 4 * fdiff_std, nbins,
-        # ),
+        bins=get_nbins(fdiff, fdiff_std),
         color='C1',
         edgecolor='black',
         alpha=0.5,
@@ -1001,10 +1143,8 @@ def plot_hist_results(results, background, plotfile):
     ax = axs[1, 1]
     ax.set(xlabel=r'$b_{\mathrm{frac}}$')
 
-    # bfrac_mean = results['background_frac'].mean()
-    # bfrac_err = results['background_frac'].std() / np.sqrt(results.size)
     bfrac_mean, bfrac_std, bfrac_err = eu.stat.sigma_clip(
-        results['background_frac'],
+        results['bg_frac'],
         get_err=True,
     )
 
@@ -1016,11 +1156,8 @@ def plot_hist_results(results, background, plotfile):
     )
 
     ax.hist(
-        results['background_frac'],
-        bins=nbins,
-        # bins=np.linspace(
-        #     bfrac_mean - 4 * bfrac_std, bfrac_mean + 4 * bfrac_std, nbins,
-        # ),
+        results['bg_frac'],
+        bins=get_nbins(results['bg_frac'], bfrac_std),
         color='C1',
         edgecolor='black',
         alpha=0.5,
@@ -1033,15 +1170,116 @@ def plot_hist_results(results, background, plotfile):
 
 def make_result(n=1):
     dtype = [
-        ('background', 'f4'),
-        ('background_err', 'f4'),
-        ('background_frac', 'f4'),
+        ('bg', 'f4'),
+        ('bg_err', 'f4'),
+        ('bg_frac', 'f4'),
     ]
 
     return np.zeros(n, dtype=dtype)
 
 
 def main(
+    method,
+    ntrial,
+    nper,
+    flux_min,
+    flux_max,
+    stamp_size,
+    noise,
+    background,
+    npass,
+    plotfile,
+    seed,
+    show,
+):
+    rng = np.random.RandomState(seed)
+
+    sky_prior_mean = 0.0
+    sky_prior_sigma = noise
+    assert 1 <= npass <= 2
+
+    print('simulating stacks')
+    observations = []
+    for i in trange(ntrial, ascii=True, ncols=70):
+        fwhm = get_fwhm(rng)
+        e1, e2 = get_e1e2(rng)
+
+        tmpobs = simulate_stack(
+            nobj=nper,
+            fwhm=fwhm,
+            e1=e2,
+            e2=e2,
+            stamp_size=stamp_size,
+            flux_min=flux_min,
+            flux_max=flux_max,
+            noise=noise,
+            background=background,
+            rng=rng,
+
+        )
+        observations.append(tmpobs)
+
+    print('doing fits')
+    for ipass in range(npass):
+        if npass == 2:
+            print(f'pass {ipass + 1}')
+
+        dlist = []
+        for i in trange(ntrial, ascii=True, ncols=70):
+
+            # fwhm = get_fwhm(rng)
+            # e1, e2 = get_e1e2(rng)
+
+            # obstot = simulate_stack(
+            #     nobj=nper,
+            #     fwhm=fwhm,
+            #     e1=e2,
+            #     e2=e2,
+            #     stamp_size=stamp_size,
+            #     flux_min=flux_min,
+            #     flux_max=flux_max,
+            #     noise=noise,
+            #     background=background,
+            #     rng=rng,
+            #
+            # )
+            # if npass == 2:
+            #     observations.append(obstot)
+            obstot = observations[i]
+
+            res = fit_stack(
+                obs=obstot,
+                method=method,
+                noise=noise,
+                rng=rng,
+                sky_prior_mean=sky_prior_mean,
+                sky_prior_sigma=sky_prior_sigma,
+            )
+
+            if res is None:
+                continue
+
+            tres = make_result()
+
+            bg = res['bg']
+            bg_err = res['bg_err']
+            tres['bg_frac'] = res['bg_frac']
+            # print(res['bg_frac'])
+
+            tres['bg'] = bg
+            tres['bg_err'] = bg_err
+
+            dlist.append(tres)
+
+        results = eu.numpy_util.combine_arrlist(dlist)
+        if npass == 2:
+            sky_prior_mean, sky_prior_sigma = eu.stat.sigma_clip(results['bg'])
+            # sky_prior_sigma *= np.sqrt(2)
+
+    plot_hist_results(results, background, plotfile=plotfile)
+
+
+def main_orig(
     method,
     ntrial,
     nper,
@@ -1057,13 +1295,13 @@ def main(
     rng = np.random.RandomState(seed)
 
     dlist = []
-    for i in trange(ntrial):
+    for i in trange(ntrial, ascii=True, ncols=70):
         tres = make_result()
 
         fwhm = get_fwhm(rng)
         e1, e2 = get_e1e2(rng)
 
-        res = do_trial_avg(
+        res, obstot = do_trial_avg(
             method=method,
             nobj=nper,
             fwhm=fwhm,
@@ -1082,11 +1320,11 @@ def main(
 
         bg = res['bg']
         bg_err = res['bg_err']
-        tres['background_frac'] = res['bg_frac']
+        tres['bg_frac'] = res['bg_frac']
         # print(res['bg_frac'])
 
-        tres['background'] = bg
-        tres['background_err'] = bg_err
+        tres['bg'] = bg
+        tres['bg_err'] = bg_err
 
         dlist.append(tres)
 
@@ -1113,6 +1351,7 @@ def get_args():
         default=-0.3,
         help='background value',
     )
+    parser.add_argument('--npass', type=int, default=1)
     parser.add_argument('--show', action='store_true')
     return parser.parse_args()
 
@@ -1130,5 +1369,6 @@ if __name__ == '__main__':
         noise=args.noise,
         background=args.background,
         plotfile=args.plotfile,
+        npass=args.npass,
         show=args.show,
     )
