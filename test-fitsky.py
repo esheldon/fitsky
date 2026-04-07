@@ -960,7 +960,8 @@ def plot_hist_results(results, background, plotfile):
         xlabel=r'$(b - b_{\mathrm{true}}) / \sigma$',
     )
 
-    mean_err = results['background_err'].mean()
+    # mean_err = results['background_err'].mean()
+    mean_err = np.median(results['background_err'])
     fdiff = (results['background'] - background) / mean_err
 
     fdiff_mean, fdiff_std, fdiff_err = eu.stat.sigma_clip(
