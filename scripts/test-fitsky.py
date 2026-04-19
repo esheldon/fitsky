@@ -8,158 +8,17 @@ from ngmix.gmix.gmix_nb import (
     gmix_eval_pixel_fast,
 )
 from ngmix.defaults import LOWVAL
-import galsim
 from tqdm import trange
 import esutil as eu
+
+from sfitsky.coellip_fitter import get_coellip_runner_with_sky
+from sfitsky.sim import simulate_stack, get_fwhm, get_e1e2
 
 PIXEL_SCALE = 0.2
 FWHM_MEAN = 0.8
 FWHM_SIGMA = 0.1
 FWHM_MIN = 0.65
 E_SIGMA = 0.03
-
-# NOISE = 1.0
-# NOISE = 0.00001
-# NOISE = 0.01
-
-
-def get_fwhm(rng):
-    p = ngmix.priors.LogNormal(mean=FWHM_MEAN, sigma=FWHM_SIGMA, rng=rng)
-
-    while True:
-        fwhm = p.sample()
-        if fwhm > FWHM_MIN:
-            break
-
-    return fwhm
-
-
-def get_e1e2(rng):
-    while True:
-        e1, e2 = rng.normal(scale=E_SIGMA, size=2)
-        e = np.sqrt(e1 ** 2 + e2 ** 2)
-        if e < 0.99:
-            break
-
-    return e1, e2
-
-
-class PriorCoellipWithSky(ngmix.joint_prior.PriorSimpleSep):
-    def __init__(
-        self, ngauss, cen_prior, g_prior, T_prior, F_prior, sky_prior
-    ):
-        self.ngauss = ngauss
-        self.npars = ngmix.gmix.get_coellip_npars(ngauss) + 1
-
-        super().__init__(
-            cen_prior, g_prior, T_prior, F_prior
-        )
-        self.sky_prior = sky_prior
-
-        if self.nband != 1:
-            raise ValueError("coellip only supports one band")
-
-        self.bounds = None
-
-    def set_bounds(self):
-        """
-        set possibe bounds
-        """
-        self.bounds = None
-
-    def fill_fdiff(self, pars, fdiff):
-        """
-        set sqrt(-2ln(p)) ~ (model-data)/err
-
-        Parameters
-        ----------
-        pars: array
-            Array of parameters values
-        fdiff: array
-            the fdiff array to fill
-        """
-
-        if len(pars) != self.npars:
-            raise ValueError(
-                'pars size %d expected %d' % (len(pars), self.npars)
-            )
-
-        ngauss = self.ngauss
-
-        index = 0
-
-        lnp1, lnp2 = self.cen_prior.get_lnprob_scalar_sep(pars[0], pars[1])
-
-        fdiff[index] = lnp1
-        index += 1
-        fdiff[index] = lnp2
-        index += 1
-
-        fdiff[index] = self.g_prior.get_lnprob_scalar2d(pars[2], pars[3])
-        index += 1
-
-        for i in range(ngauss):
-            fdiff[index] = self.T_prior.get_lnprob_scalar(pars[4 + i])
-            index += 1
-
-        F_prior = self.F_priors[0]
-        for i in range(ngauss):
-            fdiff[index] = F_prior.get_lnprob_scalar(pars[4 + ngauss + i])
-            index += 1
-
-        # sky
-        fdiff[index] = self.sky_prior.get_lnprob_scalar(
-            # ngauss for T and flux, plus one for sky
-            pars[4 + 2 * ngauss]
-        )
-        index += 1
-
-        chi2 = -2 * fdiff[0:index]
-        chi2.clip(min=0.0, max=None, out=chi2)
-        fdiff[0:index] = np.sqrt(chi2)
-
-        return index
-
-    def sample(self, nrand=None):
-        """
-        Get random samples
-
-        Parameters
-        ----------
-        nrand: int, optional
-            Number of samples, default to a single set with size [npars].  If n
-            is sent the result will have shape [n, npars]
-        """
-
-        if nrand is None:
-            is_scalar = True
-            nrand = 1
-        else:
-            is_scalar = False
-
-        ngauss = self.ngauss
-        samples = np.zeros((nrand, self.npars))
-
-        cen1, cen2 = self.cen_prior.sample(nrand)
-        g1, g2 = self.g_prior.sample2d(nrand)
-        T = self.T_prior.sample(nrand)
-
-        samples[:, 0] = cen1
-        samples[:, 1] = cen2
-        samples[:, 2] = g1
-        samples[:, 3] = g2
-        samples[:, 4] = T
-
-        for i in range(ngauss):
-            samples[:, 4 + i] += self.T_prior.sample(nrand)
-
-        F_prior = self.F_priors[0]
-        for i in range(ngauss):
-            samples[:, 4 + ngauss + i] = F_prior.sample(nrand)
-
-        if is_scalar:
-            samples = samples[0, :]
-        return samples
 
 
 @njit
@@ -189,217 +48,6 @@ def fill_fdiff_with_sky(gmix, sky, pixels, fdiff, start):
         model_val = gmix_eval_pixel_fast(gmix, pixel) + sky
 
         fdiff[start + ipixel] = (model_val - pixel_val) * pixel["ierr"]
-
-
-class FitSkyCoellipFitter(ngmix.fitting.CoellipFitter):
-    def _make_fit_model(self, obs, guess):
-        return FitSkyCoellipFitModel(
-            obs=obs,
-            ngauss=self._ngauss,
-            guess=guess,
-            prior=self.prior,
-        )
-
-
-class FitSkyCoellipFitModel(ngmix.fitting.results.CoellipFitModel):
-    def calc_fdiff(self, pars):
-        """
-        vector with (model-data)/error.
-
-        The npars elements contain -ln(prior)
-        """
-
-        # we cannot keep sending existing array into leastsq, don't know why
-        fdiff = np.zeros(self.fdiff_size)
-
-        # c1, c2, g1, g2, T1, ..TN, F1...FN, sky
-        # sky = pars[4 + 2 * self._ngauss]
-        sky = pars[-1]
-
-        try:
-            # all norms are set after fill
-            self._fill_gmix_all(pars)
-
-            start = self._fill_priors(pars=pars, fdiff=fdiff)
-
-            for pixels, gm in zip(self._pixels_list, self._gmix_data_list):
-                fill_fdiff_with_sky(gm, sky, pixels, fdiff, start)
-
-                start += pixels.size
-
-        except GMixRangeError:
-            fdiff[:] = LOWVAL
-
-        return fdiff
-
-    def set_fit_result(self, result):
-        super().set_fit_result(result)
-        self['sky'] = result['pars'][-1]
-        self['sky_err'] = np.sqrt(result["pars_cov"][-1, -1])
-
-    def get_gmix(self, band=0):
-        """
-        Get a gaussian mixture at the fit parameter set, which
-        definition depends on the sub-class
-
-        Parameters
-        ----------
-        band: int, optional
-            Band index, default 0
-        """
-        pars = self.get_band_pars(pars=self["pars"][:-1], band=band)
-        return ngmix.gmix.make_gmix_model(pars, self.model)
-
-    def _init_gmix_all(self, pars):
-        super()._init_gmix_all(pars[:-1])
-
-    def _fill_gmix_all(self, pars):
-        super()._fill_gmix_all(pars[:-1])
-
-    def _set_npars(self):
-        """
-        single band, npars determined from ngauss
-        """
-        # add one for sky
-        self.npars = 4 + 2 * self._ngauss + 1
-
-    def _set_n_prior_pars(self):
-        # center1 + center2 + shape + T + fluxes
-        if self.prior is None:
-            self.n_prior_pars = 0
-        else:
-            # add one for sky
-            ngauss = self._ngauss
-            self.n_prior_pars = 1 + 1 + 1 + ngauss + ngauss + 1
-
-
-def get_coellip_with_sky_prior(
-    rng,
-    ngauss,
-    scale,
-    sky_prior_mean,
-    sky_prior_sigma,
-    T_range=None,
-    F_range=None,
-):
-    """
-    get a prior for use with the maximum likelihood fitter
-
-    Parameters
-    ----------
-    rng: np.random.RandomState
-        The random number generator
-    scale: float
-        Pixel scale
-    T_range: (float, float), optional
-        The range for the prior on T
-    F_range: (float, float), optional
-        Fhe range for the prior on flux
-    """
-    if T_range is None:
-        T_range = [-1.0, 1.0e3]
-        # T_range = [0.05, 1.e3]
-    if F_range is None:
-        F_range = [-100.0, 1.0e9]
-        # F_range = [0.05, 1.e9]
-
-    g_prior = ngmix.priors.GPriorBA(sigma=0.5, rng=rng)
-    cen_prior = ngmix.priors.CenPrior(
-        cen1=0,
-        cen2=0,
-        sigma1=scale * 0.01,
-        sigma2=scale * 0.01,
-        rng=rng,
-    )
-    T_prior = ngmix.priors.FlatPrior(
-        minval=T_range[0],
-        maxval=T_range[1],
-        rng=rng,
-    )
-    F_prior = ngmix.priors.FlatPrior(
-        minval=F_range[0],
-        maxval=F_range[1],
-        rng=rng,
-    )
-
-    sky_prior = ngmix.priors.Normal(
-        mean=sky_prior_mean,
-        sigma=sky_prior_sigma,
-        # mean=0,
-        # sigma=2 * abs(background),
-        # mean=background,
-        # sigma=0.1 * background,
-        rng=rng,
-    )
-
-    prior = PriorCoellipWithSky(
-        ngauss=ngauss,
-        cen_prior=cen_prior,
-        g_prior=g_prior,
-        T_prior=T_prior,
-        F_prior=F_prior,
-        sky_prior=sky_prior,
-    )
-
-    return prior
-
-
-class FitSkyCoellipPSFGuesser(ngmix.guessers.CoellipPSFGuesser):
-    def __call__(self, obs):
-        """
-        Get a guess for the EM algorithm
-
-        Parameters
-        ----------
-        obs: Observation
-            Starting flux and T for the overall mixture are derived from the
-            input observation.  How depends on the gauss_from_moms constructor
-            argument
-
-        Returns
-        -------
-        guess: array
-            The guess array, [cen1, cen2, g1, g2, T1, T2, ..., F1, F2, ...]
-        """
-        sky_guess = self.rng.normal(scale=0.01)
-
-        guess0 = super()._get_guess(obs=obs)
-
-        guess = np.zeros(guess0.size + 1)
-        guess[:guess0.size] = guess0
-
-        guess[-1] = sky_guess
-
-        return guess
-
-
-def get_coellip_runner_with_sky(
-    rng,
-    ngauss,
-    sky_prior_mean,
-    sky_prior_sigma,
-):
-    # prior = None
-    prior = get_coellip_with_sky_prior(
-        ngauss=ngauss,
-        rng=rng,
-        scale=PIXEL_SCALE,
-        sky_prior_mean=sky_prior_mean,
-        sky_prior_sigma=sky_prior_sigma,
-    )
-
-    fitter = FitSkyCoellipFitter(ngauss=ngauss, prior=prior)
-
-    # guesser = ngmix.guessers.SimplePSFGuesser(
-    #     rng=rng, guess_from_moms=True,
-    # )
-    guesser = FitSkyCoellipPSFGuesser(rng=rng, ngauss=ngauss)
-
-    return ngmix.runners.Runner(
-        fitter=fitter,
-        guesser=guesser,
-        ntry=2,
-    )
 
 
 @njit
@@ -516,59 +164,6 @@ class SubMeanFitModel(ngmix.fitting.results.FitModel):
             fdiff[:] = LOWVAL
 
         return fdiff
-
-
-def make_obj(flux, fwhm, e1, e2):
-    return galsim.Moffat(
-        fwhm=fwhm,
-        flux=flux,
-        beta=3.5,
-    ).shear(
-        e1=e1,
-        e2=e2,
-    )
-
-
-def make_image(rng, fwhm, e1, e2, flux, stamp_size, noise):
-    obj = make_obj(flux=flux, e1=e1, e2=e2, fwhm=fwhm)
-
-    offset = rng.uniform(low=-0.5, high=0.5, size=2)
-    gsim = obj.drawImage(
-        nx=stamp_size,
-        ny=stamp_size,
-        scale=PIXEL_SCALE,
-        offset=offset,
-        # method='no_pixel',
-    )
-
-    im = gsim.array
-    im += rng.normal(scale=noise, size=im.shape)
-    return im
-
-
-def make_obs(rng, fwhm, e1, e2, flux, stamp_size, noise):
-    im = make_image(
-        rng=rng,
-        fwhm=fwhm,
-        e1=e1,
-        e2=e2,
-        flux=flux,
-        stamp_size=stamp_size,
-        noise=noise,
-    )
-
-    cen = (np.array(im.shape) - 1.0) / 2.0
-
-    jac = ngmix.DiagonalJacobian(
-        row=cen[0],
-        col=cen[1],
-        scale=PIXEL_SCALE,
-    )
-    return ngmix.Observation(
-        image=im,
-        weight=im * 0 + 1.0 / noise ** 2,
-        jacobian=jac,
-    )
 
 
 def get_coellip_prior(rng, ngauss, scale, T_range=None, F_range=None):
@@ -697,9 +292,6 @@ def get_coellip_runner(rng, ngauss, submean=False):
     else:
         fitter = ngmix.fitting.CoellipFitter(ngauss=ngauss, prior=prior)
 
-    # guesser = ngmix.guessers.SimplePSFGuesser(
-    #     rng=rng, guess_from_moms=True,
-    # )
     guesser = ngmix.guessers.CoellipPSFGuesser(rng=rng, ngauss=ngauss)
 
     return ngmix.runners.Runner(
@@ -718,20 +310,6 @@ def get_flux(res, obs):
     msq_sum = (model * model).sum()
     flux = xcorr_sum / msq_sum
     return flux
-
-
-def make_cat(n=1):
-    dtype = [
-        ('flux_true', 'f4'),
-        ('snr', 'f4'),
-        ('T', 'f4'),
-        ('T_err', 'f4'),
-        ('flux', 'f4'),
-        ('flux_err', 'f4'),
-        ('bg', 'f4'),
-        ('bg_err', 'f4'),
-    ]
-    return np.zeros(n, dtype=dtype)
 
 
 def fit_for_background(obs, res):
@@ -825,6 +403,7 @@ def fit_stack(
         runner = get_coellip_runner_with_sky(
             rng,
             ngauss=5,
+            cen_prior_sigma=PIXEL_SCALE * 0.01,
             sky_prior_mean=sky_prior_mean,
             sky_prior_sigma=sky_prior_sigma,
         )
@@ -868,53 +447,6 @@ def fit_stack(
         'bg_err': bg_err,
         'bg_frac': bg_frac,
     }
-
-
-def simulate_stack(
-    nobj,
-    fwhm,
-    e1,
-    e2,
-    flux_min,
-    flux_max,
-    noise,
-    background,
-    stamp_size,
-    rng,
-):
-    for i in range(nobj):
-        tcat = make_cat()
-
-        log_flux_true = rng.uniform(
-            np.log10(flux_min),
-            np.log10(flux_max),
-        )
-
-        tcat['flux_true'] = 10.0**log_flux_true
-        tobs = make_obs(
-            rng=rng,
-            flux=tcat['flux_true'],
-            fwhm=fwhm,
-            e1=e1,
-            e2=e2,
-            stamp_size=stamp_size,
-            noise=noise,
-        )
-
-        with tobs.writeable():
-            tobs.image += background
-
-        if i == 0:
-            obstot = tobs
-        else:
-            with obstot.writeable():
-                obstot.image += tobs.image
-                obstot.weight += tobs.weight
-
-    with obstot.writeable():
-        obstot.image *= 1.0 / nobj
-
-    return obstot
 
 
 def get_nbins(data, std):
@@ -1142,7 +674,7 @@ def get_args():
     parser.add_argument('--nper', type=int, default=100)
     parser.add_argument('--flux-min', type=float, default=320)
     parser.add_argument('--flux-max', type=float, default=3500)
-    parser.add_argument('--stamp-size', type=int, default=31)
+    parser.add_argument('--stamp-size', type=int, default=51)
     parser.add_argument('--noise', type=float, default=1)
     parser.add_argument(
         '--background',
